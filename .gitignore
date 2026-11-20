@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.mp4
+*.mkv
+*.log
+dist/
+.install-backups/
+estado.json
+estado.tmp
+.DS_Store
