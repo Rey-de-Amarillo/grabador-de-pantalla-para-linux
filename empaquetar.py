@@ -9,6 +9,7 @@ import tarfile
 ROOT = Path(__file__).resolve().parent
 FILES = ("README.md", "LICENSE", ".gitignore", "VERSION", "instalar.sh", "instalar.py",
          "desinstalar.sh", "iniciar.sh", "empaquetar.py", "grabador/app.py", "grabador/capture.py",
+         "grabador/audio_capture.py",
          "grabador/geometry.py", "grabador/exclusion.py", "grabador/pixel_filter.py",
          "grabador/x11_underlay.py", "grabador/icon.svg")
 

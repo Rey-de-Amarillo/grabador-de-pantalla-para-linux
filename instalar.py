@@ -18,11 +18,12 @@ import tempfile
 
 APP_ID = "ar.workraken.GrabadorPantalla"
 APP_NAME = "Grabador de pantalla de Linux"
-FILES = ("app.py", "capture.py", "geometry.py", "exclusion.py",
+FILES = ("app.py", "capture.py", "audio_capture.py", "geometry.py", "exclusion.py",
          "pixel_filter.py", "x11_underlay.py", "icon.svg")
 GST_FACTORIES = ("ximagesrc", "queue", "videorate", "videoconvert", "capsfilter",
                  "x264enc", "h264parse", "mp4mux", "filesink", "adder",
-                 "audioconvert", "audioresample", "avenc_aac", "aacparse", "pulsesrc")
+                 "audioconvert", "audioresample", "avenc_aac", "aacparse", "pulsesrc",
+                 "wavenc", "level")
 
 
 def check_dependencies():
@@ -56,7 +57,15 @@ def desktop_quote(value):
     escaped = value.replace("%", "%%")
     for character in ("\\", '"', "`", "$"):
         escaped = escaped.replace(character, "\\" + character)
-    return '"' + escaped + '"'
+    return ('"' + escaped + '"').replace("\\", "\\\\")
+
+
+def assert_safe_parents(path):
+    for folder in reversed((path, *path.parents)):
+        if folder.is_symlink():
+            raise RuntimeError(f"No se operará dentro de un enlace: {folder}")
+        if folder.exists() and not folder.is_dir():
+            raise RuntimeError(f"La carpeta de destino no es un directorio: {folder}")
 
 
 def main():
@@ -70,34 +79,37 @@ def main():
         check_dependencies()
         print("Dependencias disponibles.")
         return 0
-    prefix = options.prefix.expanduser().resolve()
-    if any(character in str(prefix) for character in ("\n", "\r", "\0")):
+    prefix = Path(os.path.abspath(options.prefix.expanduser()))
+    if any(character in str(prefix) for character in ("\n", "\r", "\0", "\t")):
         raise RuntimeError("El destino contiene caracteres no admitidos.")
     if prefix in (Path("/"), Path.home(), Path("/usr"), Path("/usr/local")):
         raise RuntimeError("Elegí una carpeta de instalación propia, como ~/.local.")
     destination = prefix / "share/grabador-pantalla"
     executable = prefix / "bin/grabador-pantalla"
     desktop = prefix / "share/applications" / (APP_ID + ".desktop")
-    targets = [destination / name for name in FILES] + [executable, desktop]
+    voice_executable = prefix / "bin/grabador-voz"
+    voice_desktop = prefix / "share/applications/ar.workraken.GrabadorVoz.desktop"
+    targets = [destination / name for name in FILES] + [executable, desktop, voice_executable, voice_desktop]
     # Read and validate the payload before changing any installed file.
     source = Path(__file__).resolve().parent / "grabador"
+    payload = {}
     if not options.uninstall:
         check_dependencies()
         for name in FILES:
             path = source / name
-            if not path.is_file():
+            if not path.is_file() or path.is_symlink():
                 raise RuntimeError(f"El paquete está incompleto: falta grabador/{name}.")
+            payload[name] = path.read_bytes()
             if name.endswith(".py"):
-                compile(path.read_bytes(), str(path), "exec")
+                compile(payload[name], str(path), "exec")
     # Fixed allowlist only. Refuse links that could point at unrelated files.
     for target in targets:
+        assert_safe_parents(target.parent)
         if target.is_symlink():
             raise RuntimeError(f"No se reemplazará el enlace: {target}")
         if target.exists() and not target.is_file():
             raise RuntimeError(f"El destino no es un archivo: {target}")
-    for folder in (destination, executable.parent, desktop.parent):
-        if folder.is_symlink():
-            raise RuntimeError(f"No se instalará dentro de un enlace: {folder}")
+    assert_safe_parents(prefix / "share/grabador-pantalla-backups")
     stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
     backup = prefix / "share/grabador-pantalla-backups" / (stamp + ("-desinstalar" if options.uninstall else "-instalar"))
     suffix = 1
@@ -113,6 +125,8 @@ def main():
             saved = backup / relative
             saved.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, saved)
+            if digest(saved) != digest(target):
+                raise RuntimeError(f"No se verificó la copia de seguridad: {target}")
     (backup / "manifest.json").write_text(json.dumps({"prefix": str(prefix), "files": existed}, ensure_ascii=False, indent=2) + "\n")
     changed = []
 
@@ -142,27 +156,40 @@ def main():
                         raise RuntimeError(f"No se pudo quitar: {target}")
         else:
             for name in FILES:
-                replace(destination / name, (source / name).read_bytes(), 0o644)
+                replace(destination / name, payload[name], 0o644)
             wrapper = ("#!/bin/sh\nset -eu\n"
                        'if [ "${XDG_SESSION_TYPE:-}" = wayland ]; then\n'
                        "    echo 'El grabador necesita una sesión X11.' >&2\n    exit 1\nfi\n"
                        f"exec /usr/bin/python3 {shlex.quote(str(destination / 'app.py'))} \"$@\"\n")
             replace(executable, wrapper.encode(), 0o755)
             entry = (f"[Desktop Entry]\nType=Application\nName={APP_NAME}\n"
-                     "Comment=Grabar una región de pantalla con audio\n"
+                     "Comment=Grabar una región de pantalla o sólo voz desde una barra pequeña\n"
                      f"Exec={desktop_quote(str(executable))}\nIcon={destination / 'icon.svg'}\n"
                      "Terminal=false\nCategories=AudioVideo;Recorder;\nStartupNotify=false\n"
                      "StartupWMClass=GrabadorPantalla\n")
             replace(desktop, entry.encode(), 0o644)
+            voice_wrapper = ("#!/bin/sh\nset -eu\n"
+                             f"exec {shlex.quote(str(executable))} --audio \"$@\"\n")
+            replace(voice_executable, voice_wrapper.encode(), 0o755)
+            voice_entry = ("[Desktop Entry]\nType=Application\nName=Grabador de voz de Linux\n"
+                           "Comment=Grabar sólo el micrófono desde la barra del grabador\n"
+                           f"Exec={desktop_quote(str(voice_executable))}\n"
+                           "Icon=audio-input-microphone\nTerminal=false\n"
+                           "Categories=AudioVideo;Audio;Recorder;\nStartupNotify=false\n"
+                           "StartupWMClass=GrabadorPantalla\n")
+            replace(voice_desktop, voice_entry.encode(), 0o644)
             validator = shutil.which("desktop-file-validate")
             if validator:
-                subprocess.run([validator, str(desktop)], check=True, capture_output=True, text=True)
-            assert all(digest(source / name) == digest(destination / name) for name in FILES)
+                subprocess.run([validator, str(desktop), str(voice_desktop)], check=True, capture_output=True, text=True)
+            if not all(hashlib.sha256(payload[name]).hexdigest() == digest(destination / name) for name in FILES):
+                raise RuntimeError("No se verificaron los archivos instalados.")
     except BaseException:
         for target in reversed(changed):
             relative = target.relative_to(prefix)
             if existed[str(relative)]:
                 shutil.copy2(backup / relative, target)
+                if digest(target) != digest(backup / relative):
+                    raise RuntimeError(f"No se pudo restaurar: {target}")
             elif target.exists():
                 target.unlink()
         raise
@@ -170,7 +197,7 @@ def main():
     if updater and desktop.parent.exists():
         subprocess.run([updater, str(desktop.parent)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if options.uninstall:
-        print("Grabador desinstalado. Tus videos y tu estado se conservaron.")
+        print("Grabador desinstalado. Tus videos, audios y tu estado se conservaron.")
     else:
         print(f"Instalado: {APP_NAME}\nEjecutable: {executable}")
         if executable.parent != Path.home() / ".local/bin":

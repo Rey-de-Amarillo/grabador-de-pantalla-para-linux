@@ -8,3 +8,6 @@ dist/
 estado.json
 estado.tmp
 .DS_Store
+*.wav
+backups/
+output/
