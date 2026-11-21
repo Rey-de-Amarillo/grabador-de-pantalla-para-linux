@@ -92,6 +92,45 @@ class VoiceFilterTests(unittest.TestCase):
         stats = vf.process_wave(self.source, self.destination, threading.Event())
         self.assertFalse(stats["speech_detected"])
 
+    def test_modulated_low_room_hum_does_not_grant_makeup_gain(self):
+        rng = random.Random(200)
+        samples = []
+        for i in range(vf.RATE * 3):
+            t = i / vf.RATE
+            amplitude = .006 * (.6 + .4 * math.sin(2 * math.pi * 1.7 * t))
+            samples.append(amplitude * math.sin(2 * math.pi * 50 * t) + rng.gauss(0, .0007))
+        self.write(samples)
+        stats = vf.process_wave(self.source, self.destination, threading.Event())
+        self.assertFalse(stats["speech_detected"])
+
+    def test_isolated_leading_and_trailing_clicks_are_attenuated(self):
+        rng = random.Random(305)
+        samples = [rng.gauss(0, .002) for _ in range(vf.RATE)]
+        for j in range(20):
+            click = .65 * math.exp(-j / 5) * (-1 if j % 2 else 1)
+            samples[j] += click
+            samples[-1 - j] += click
+        self.write(samples)
+        stats = vf.process_wave(self.source, self.destination, threading.Event())
+        _params, cleaned = self.read()
+        self.assertEqual(len(cleaned), len(samples))
+        self.assertEqual(stats["clicks_attenuated"], 2)
+        self.assertLess(max(abs(value) for value in cleaned[:240]), max(abs(value) for value in samples[:240]) * .25)
+        self.assertLess(max(abs(value) for value in cleaned[-240:]), max(abs(value) for value in samples[-240:]) * .25)
+
+    def test_quiet_consonant_context_is_protected_from_gap_expansion(self):
+        # A breathy onset and ending adjacent to a voiced word must not be
+        # classified as a quiet gap merely because their level is low.
+        rng = random.Random(300)
+        cells = [(0.002, 0.006)] * 200
+        cells[60:120] = [(.02, .05)] * 60
+        cells[42:60] = [(.003, .009)] * 18
+        cells[120:138] = [(.003, .009)] * 18
+        gains = vf._quiet_gains(cells, .002, [], 60)
+        self.assertTrue(all(gain == 1 for gain in gains[42:138]))
+        self.assertAlmostEqual(gains[0], 10 ** (-12 / 20))
+        self.assertAlmostEqual(gains[-1], 10 ** (-12 / 20))
+
     def test_silence_and_partial_final_frame_keep_exact_duration(self):
         for count in (1, 959, 960, 1001):
             with self.subTest(frames=count):

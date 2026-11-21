@@ -28,6 +28,7 @@ from geometry import clamp_toolbar_position, selection_region, toolbar_position
 
 LOGGER = logging.getLogger("grabador")
 APP_NAME = "Grabador de pantalla de Linux"
+VOICE_START_DELAY_MS = 750
 
 
 def format_duration(seconds):
@@ -238,6 +239,8 @@ class RecorderApp(Gtk.Application):
         self.timer_source = None
         self.closing = False
         self.start_source = None
+        self.audio_start_source = None
+        self.audio_start_deadline = None
         self.keybinder = None
         self.manual_toolbar_position = None
         self.toolbar_drag = None
@@ -478,6 +481,7 @@ class RecorderApp(Gtk.Application):
         if self.toolbar is None:
             return
         capturing = self.state in {"starting", "recording", "paused", "stopping", "saving"}
+        preparing_audio = self.mode == "audio" and self.state == "starting"
         # Recorder-only setting: application tooltips are never captured.
         Gtk.Settings.get_default().set_property("gtk-enable-tooltips", not capturing)
         if capturing:
@@ -487,13 +491,14 @@ class RecorderApp(Gtk.Application):
         for mode, button, icon in (("video", self.button, self.icon),
                                    ("audio", self.mode_button, self.mode_icon)):
             selected = self.mode == mode
-            icon.recording = capturing and selected
+            icon.recording = capturing and selected and not preparing_audio
             icon.queue_draw()
             style = button.get_style_context()
             (style.add_class if selected else style.remove_class)("selected")
             button.set_sensitive(self.state == "idle" or (selected and self.state in {
                 "starting", "recording", "paused", "ready"}))
-            action = ("Detener y guardar grabación" if capturing and selected else
+            action = ("Cancelar espera del micrófono" if preparing_audio and selected else
+                      "Detener y guardar grabación" if capturing and selected else
                       "Guardar audio" if self.state == "ready" and selected else
                       "Seleccionar voz" if mode == "audio" else "Seleccionar pantalla")
             button.get_accessible().set_name(action)
@@ -544,7 +549,7 @@ class RecorderApp(Gtk.Application):
         if self.session is not None:
             self.last_elapsed = self.session.statistics["elapsed_seconds"]
         if self.timer_label is not None:
-            value = format_duration(self.last_elapsed)
+            value = "…" if self.mode == "audio" and self.state == "starting" else format_duration(self.last_elapsed)
             if self.timer_label.get_text() != value:
                 self.timer_label.set_text(value)
                 self.write_status()
@@ -620,8 +625,10 @@ class RecorderApp(Gtk.Application):
         return self.select_or_stop("video")
 
     def begin_audio(self):
+        self.clear_audio_start()
         self._generation += 1
         generation = self._generation
+        self.audio_start_deadline = GLib.get_monotonic_time() + VOICE_START_DELAY_MS * 1000
         self.region = None
         self.last_elapsed = 0.0
         self.preview_open_requested = False
@@ -660,6 +667,14 @@ class RecorderApp(Gtk.Application):
         if error:
             self.failed(error)
             return False
+        if self.audio_start_deadline is not None:
+            remaining_us = self.audio_start_deadline - GLib.get_monotonic_time()
+            if remaining_us > 0:
+                if self.audio_start_source is None:
+                    self.audio_start_source = GLib.timeout_add(
+                        max(1, math.ceil(remaining_us / 1000)), self.delayed_audio_start, generation, device)
+                return False
+        self.clear_audio_start()
         try:
             self.session = AudioSession(device=device, normalize_peak=True, clean_voice=True,
                 on_started=lambda: self.audio_event(generation, self.started),
@@ -671,6 +686,19 @@ class RecorderApp(Gtk.Application):
             LOGGER.exception("No se pudo iniciar el micrófono")
             self.failed(str(error))
         return False
+
+    def delayed_audio_start(self, generation, device):
+        if generation != self._generation:
+            return False
+        self.audio_start_source = None
+        return self.start_audio(generation, device, None)
+
+    def clear_audio_start(self):
+        if self.audio_start_source is not None:
+            if GLib.MainContext.default().find_source_by_id(self.audio_start_source) is not None:
+                GLib.source_remove(self.audio_start_source)
+            self.audio_start_source = None
+        self.audio_start_deadline = None
 
     def audio_event(self, generation, callback, *args):
         if generation == self._generation and self.session is not None:
@@ -746,6 +774,11 @@ class RecorderApp(Gtk.Application):
             self.change_state("recording")
 
     def stop_recording(self):
+        if self.mode == "audio" and self.state == "starting" and self.session is None:
+            self._generation += 1
+            self.clear_audio_start()
+            self.completed(None)
+            return False
         if self.start_source is not None:
             GLib.source_remove(self.start_source)
             self.start_source = None
@@ -786,6 +819,11 @@ class RecorderApp(Gtk.Application):
             self.change_state("paused" if session.paused else "recording")
 
     def cancel_recording(self):
+        if self.mode == "audio" and self.state == "starting" and self.session is None:
+            self._generation += 1
+            self.clear_audio_start()
+            self.cancelled()
+            return False
         if self.start_source is not None:
             GLib.source_remove(self.start_source)
             self.start_source = None
@@ -813,6 +851,7 @@ class RecorderApp(Gtk.Application):
         return False
 
     def cancelled(self):
+        self.clear_audio_start()
         self.session = None
         self.region = None
         self.last_elapsed = 0.0
@@ -824,6 +863,7 @@ class RecorderApp(Gtk.Application):
             self.place_toolbar()
 
     def completed(self, path):
+        self.clear_audio_start()
         self.update_timer()
         if path is not None:
             self.last_saved = Path(path)
@@ -866,6 +906,7 @@ class RecorderApp(Gtk.Application):
 
     def do_shutdown(self):
         self._generation += 1
+        self.clear_audio_start()
         if self.session is not None:
             self.session.cancel()
             self.session = None

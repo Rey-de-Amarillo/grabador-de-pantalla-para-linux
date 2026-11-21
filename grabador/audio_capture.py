@@ -536,6 +536,9 @@ class AudioSession:
                 destination.replace(source)
             self._normalization_path = None
             self._normalization_gain = gain
+            if self.clean_voice:
+                LOGGER.info("Procesamiento de voz: aumento %.2f dB; limpieza %s",
+                            20 * math.log10(max(gain, 1e-10)), self._voice_cleanup)
             self._ready()
         except OSError as exc:
             LOGGER.warning("No se pudo publicar el audio normalizado; se conserva el WAV original: %s", exc)

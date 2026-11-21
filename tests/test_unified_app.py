@@ -53,6 +53,7 @@ class UnifiedToolbarTests(unittest.TestCase):
 
     def tearDown(self):
         self.recorder._generation += 1
+        self.recorder.clear_audio_start()
         for session in self.sessions:
             session.cancel()
         self.synthetic.stop()
@@ -308,6 +309,106 @@ class UnifiedToolbarTests(unittest.TestCase):
             self.wait_for(lambda: recorder.state == "recording")
         self.assertEqual(recorder.session.device, "digital-microphone")
         self.assertEqual(run.call_count, 2)
+
+    def test_play_waits_750ms_before_opening_microphone_and_starts_clock_after_wait(self):
+        recorder = self.recorder
+        recorder.set_mode("audio")
+        sources = [{"name": "digital-microphone", "mute": False}]
+        responses = [subprocess.CompletedProcess([], 0, stdout=json.dumps(sources)),
+                     subprocess.CompletedProcess([], 0, stdout="digital-microphone\n")]
+        opened_at = []
+        def open_session(**kwargs):
+            opened_at.append(app.GLib.get_monotonic_time())
+            return self.make_session(**kwargs)
+        before = app.GLib.get_monotonic_time()
+        with mock.patch.object(app, "AudioSession", side_effect=open_session):
+            with mock.patch.object(app.subprocess, "run", side_effect=responses):
+                recorder.pause_button.clicked()
+                self.wait_for(lambda: recorder.audio_start_source is not None)
+            deadline = recorder.audio_start_deadline
+            self.assertGreaterEqual(deadline - before, 750_000)
+            self.assertEqual(recorder.timer_label.get_text(), "…")
+            self.assertEqual(tuple(recorder.toolbar.get_size()), (299, 48))
+            self.assertEqual(recorder.state, "starting")
+            self.assertIsNone(recorder.session)
+            self.assertEqual(self.sessions, [])
+            self.assertFalse(recorder.mode_icon.recording)
+            self.assertTrue(recorder.cancel_button.get_sensitive())
+            # Even a repeated discovery callback cannot bypass the deadline
+            # or start a second timer/input.
+            source_id = recorder.audio_start_source
+            recorder.start_audio(recorder._generation, "digital-microphone", None)
+            self.assertEqual(recorder.audio_start_source, source_id)
+            self.assertEqual(opened_at, [])
+            self.wait_for(lambda: recorder.state == "recording")
+        self.assertEqual(len(opened_at), 1)
+        self.assertGreaterEqual(opened_at[0], deadline)
+        self.assertLess(recorder.last_elapsed, .1)
+        self.assertEqual(recorder.timer_label.get_text(), "00:00")
+        self.assertIsNone(recorder.audio_start_source)
+        self.assertIsNone(recorder.audio_start_deadline)
+
+    def test_cancel_stop_or_close_during_start_delay_never_opens_input(self):
+        recorder = self.recorder
+        for action in ("cancel_recording", "stop_recording", "request_quit"):
+            with self.subTest(action=action):
+                recorder.closing = False
+                recorder.quit.reset_mock()
+                recorder.state = "idle"
+                recorder.toolbar.show_all()
+                recorder.set_mode("audio")
+                sources = [{"name": "digital-microphone", "mute": False}]
+                responses = [subprocess.CompletedProcess([], 0, stdout=json.dumps(sources)),
+                             subprocess.CompletedProcess([], 0, stdout="digital-microphone\n")]
+                with mock.patch.object(app, "VOICE_START_DELAY_MS", 80), \
+                        mock.patch.object(app.subprocess, "run", side_effect=responses):
+                    recorder.pause_button.clicked()
+                    self.wait_for(lambda: recorder.audio_start_source is not None)
+                deadline = recorder.audio_start_deadline
+                old_generation = recorder._generation
+                with mock.patch.object(recorder.toolbar, "hide"):
+                    getattr(recorder, action)()
+                self.assertIsNone(recorder.audio_start_source)
+                self.assertIsNone(recorder.audio_start_deadline)
+                self.wait_for(lambda: app.GLib.get_monotonic_time() > deadline + 15_000)
+                recorder.start_audio(old_generation, "stale-microphone", None)
+                self.assertIsNone(recorder.session)
+                self.assertEqual(self.sessions, [])
+                if action == "request_quit":
+                    recorder.quit.assert_called_once_with()
+                else:
+                    self.assertEqual(recorder.state, "idle")
+                    self.assertEqual(recorder.timer_label.get_text(), "00:00")
+
+    def test_stale_delayed_callback_cannot_erase_current_timer_handle(self):
+        recorder = self.recorder
+        recorder.set_mode("audio")
+        recorder._generation += 1
+        recorder.change_state("starting")
+        recorder.audio_start_deadline = app.GLib.get_monotonic_time() + 750_000
+        recorder.start_audio(recorder._generation, "current-input", None)
+        source_id = recorder.audio_start_source
+        self.assertIsNotNone(source_id)
+        recorder.delayed_audio_start(recorder._generation - 1, "stale-input")
+        self.assertEqual(recorder.audio_start_source, source_id)
+        self.assertIsNotNone(app.GLib.MainContext.default().find_source_by_id(source_id))
+        recorder.cancel_recording()
+        self.assertIsNone(app.GLib.MainContext.default().find_source_by_id(source_id))
+        self.assertEqual(self.sessions, [])
+
+    def test_waiting_cue_remains_until_input_reports_started(self):
+        recorder = self.recorder
+        recorder.set_mode("audio")
+        recorder.session = mock.Mock(statistics={"elapsed_seconds": 0})
+        recorder.change_state("starting")
+        self.assertEqual(recorder.timer_label.get_text(), "…")
+        self.assertFalse(recorder.mode_icon.recording)
+        self.assertFalse(recorder.pause_button.get_sensitive())
+        recorder.started()
+        self.assertEqual(recorder.timer_label.get_text(), "00:00")
+        self.assertTrue(recorder.mode_icon.recording)
+        self.assertTrue(recorder.pause_button.get_sensitive())
+        recorder.session = None
 
     def test_close_stops_and_saves_pending_audio_without_opening_player(self):
         recorder = self.recorder

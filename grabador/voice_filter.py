@@ -83,6 +83,26 @@ def _periodic(samples: list[int]) -> bool:
     return False
 
 
+def _voice_pitch(samples: list[int]) -> bool:
+    """Stricter, mean-centered pitch evidence for makeup gain, never gating.
+
+    The native Speex probability can mistake varying room hum for voice. An
+    isolated pitch-like frame is therefore insufficient: the caller also
+    requires at least 160 ms of consecutive raw-input evidence.
+    """
+    values = samples[::8]
+    if len(values) < 100:
+        return False
+    mean = sum(values) / len(values)
+    values = [value - mean for value in values]
+    for lag in range(15, min(76, len(values) - 35)):
+        left, right = values[lag:], values[:-lag]
+        energy = sum(value * value for value in left) * sum(value * value for value in right)
+        if energy and sum(a * b for a, b in zip(left, right)) > .75 * math.sqrt(energy):
+            return True
+    return False
+
+
 def _analyse(recording, cancelled):
     """Only bounded metadata is retained: four energy cells per 20-ms frame."""
     cells = []
@@ -121,7 +141,12 @@ def _analyse(recording, cancelled):
             continue
         left = cells[max(0, start - 15):start]
         right = cells[end:min(len(cells), end + 15)]
-        if len(left) < 10 or len(right) < 10:
+        # At the file boundaries there is no context on one side. Permit only
+        # a very short edge impulse with ample quiet context on the other side;
+        # a consonant followed/preceded by speech is still protected.
+        leading = start <= 2 and len(right) >= 15
+        trailing = end >= len(cells) - 2 and len(left) >= 15
+        if (len(left) < 10 or len(right) < 10) and not (leading or trailing):
             continue
         context = left + right
         if any(rms > threshold for rms, _peak in context):
@@ -131,11 +156,55 @@ def _analyse(recording, cancelled):
         # High crest factor distinguishes an impulse from a short voiced tone.
         if peak / max(rms, 1 / SCALE) < 3.5 or peak < floor * 8:
             continue
-        clicks.append((max(0, start * ANALYSIS - 96), end * ANALYSIS + 96))
+        clicks.append((max(0, start * ANALYSIS - 96),
+                       min(recording.getnframes(), end * ANALYSIS + 96)))
     # Require at least 80 ms of sustained energy, rather than a click or a
     # single abrupt noise event, before granting later automatic makeup gain.
     sustained_cells = sum(end - start for start, end in spans if end - start >= 16)
     return cells, floor, clicks, sustained_cells
+
+
+def _quiet_gains(cells, floor, clicks, sustained):
+    """Soft expansion of clear gaps, with 150 ms of word-boundary protection.
+
+    A recording without a clearly separable noise floor is left untouched by
+    this stage. Gains never reach zero and do not follow individual samples.
+    """
+    size = len(cells)
+    ordered = sorted(rms for rms, _peak in cells)
+    p90 = ordered[int((size - 1) * .90)]
+    if sustained < 16 or p90 < floor * 4:
+        return [1.0] * size
+    differences = [0] * (size + 1)
+    click_index = 0
+    for index, (rms, _peak) in enumerate(cells):
+        position = index * ANALYSIS + ANALYSIS // 2
+        while click_index < len(clicks) and position >= clicks[click_index][1]:
+            click_index += 1
+        is_click = click_index < len(clicks) and clicks[click_index][0] <= position < clicks[click_index][1]
+        if rms >= floor * 2.0 and not is_click:
+            first, last = max(0, index - 30), min(size, index + 31)
+            differences[first] += 1
+            differences[last] -= 1
+    protected = []
+    active = 0
+    for index in range(size):
+        active += differences[index]
+        protected.append(active > 0)
+    # Smooth ramps lie entirely outside the protected speech context. They
+    # reach a maximum 12 dB attenuation after 60 ms of clearly quiet audio.
+    distances = [size + 12] * size
+    distance = size + 12
+    for index in range(size):
+        distance = 0 if protected[index] else distance + 1
+        distances[index] = distance
+    distance = size + 12
+    for index in range(size - 1, -1, -1):
+        distance = 0 if protected[index] else distance + 1
+        distances[index] = min(distances[index], distance)
+    quiet = 10 ** (-12 / 20)
+    return [1.0 if distance == 0 else quiet + (1 - quiet) * max(0.0, 1 - distance / 12)
+            for distance in distances]
 
 
 class _Highpass:
@@ -178,10 +247,11 @@ def process_wave(source: Path, destination: Path,
                 raise ValueError("El filtro requiere WAV mono PCM de 24 bits y 48 kHz.")
             count = recording.getnframes()
             cells, floor, clicks, sustained = _analyse(recording, cancel_event)
+            quiet_gains = _quiet_gains(cells, floor, clicks, sustained)
             state = library.speex_preprocess_state_init(FRAME, RATE)
             if not state:
                 raise FilterUnavailable("No se pudo preparar el filtro de voz.")
-            for request, number in ((0, 1), (2, 0), (8, 0), (18, -18)):
+            for request, number in ((0, 1), (2, 0), (8, 0), (18, -24)):
                 value = ctypes.c_int(number)
                 if library.speex_preprocess_ctl(state, request, ctypes.byref(value)):
                     raise FilterUnavailable("La biblioteca no admite la configuración de voz.")
@@ -214,6 +284,8 @@ def process_wave(source: Path, destination: Path,
             created = True
             processed = 0
             speech_frames = 0
+            consecutive_pitch = 0
+            longest_pitch = 0
             written = 0
             offset = 0
             click_index = 0
@@ -226,6 +298,8 @@ def process_wave(source: Path, destination: Path,
                     while offset < count + FRAME:
                         _check(cancel_event)
                         samples = _samples(recording.readframes(FRAME)) if offset < count else []
+                        consecutive_pitch = consecutive_pitch + 1 if _voice_pitch(samples) else 0
+                        longest_pitch = max(longest_pitch, consecutive_pitch)
                         for i in range(FRAME):
                             value = samples[i] / SCALE if i < len(samples) else 0.0
                             position = offset + i
@@ -234,7 +308,8 @@ def process_wave(source: Path, destination: Path,
                             if click_index < len(clicks):
                                 start, end = clicks[click_index]
                                 if start <= position < end:
-                                    fade = min(1.0, (position - start) / 96, (end - position) / 96)
+                                    fade = min(1.0, (position - start) / 96 if start else 1.0,
+                                               (end - position) / 96 if end < count else 1.0)
                                     value *= 1 - fade * (1 - 10 ** (-18 / 20))
                             value = highpass.run(value)
                             buffer[i] = max(-32768, min(32767, round(value * 32768)))
@@ -249,7 +324,12 @@ def process_wave(source: Path, destination: Path,
                             output_count = min(FRAME, count - written)
                             output = bytearray(output_count * WIDTH)
                             for i in range(output_count):
-                                output[i * WIDTH:i * WIDTH + WIDTH] = (int(buffer[i]) * 256).to_bytes(WIDTH, "little", signed=True)
+                                position = written + i
+                                cell = min(len(quiet_gains) - 1, position // ANALYSIS)
+                                fraction = (position % ANALYSIS) / ANALYSIS
+                                gain = quiet_gains[cell] * (1 - fraction) + quiet_gains[min(cell + 1, len(quiet_gains) - 1)] * fraction
+                                sample = round(int(buffer[i]) * 256 * gain)
+                                output[i * WIDTH:i * WIDTH + WIDTH] = sample.to_bytes(WIDTH, "little", signed=True)
                             cleaned.writeframesraw(output)
                             written += output_count
                         processed += 1
@@ -270,9 +350,12 @@ def process_wave(source: Path, destination: Path,
                 "speex": True, "frame_count": count,
                 "processed_frames": max(0, processed - 1),
                 "speech_frames": speech_frames,
-                "speech_detected": (sustained >= 16 or pitched_voice) and speech_frames >= 3,
+                "speech_detected": (sustained >= 16 or pitched_voice) and speech_frames >= 3 and longest_pitch >= 8,
+                "longest_voiced_frames": longest_pitch,
                 "clicks_attenuated": len(clicks), "noise_floor_dbfs": _db(floor),
-                "noise_suppression_db": -18, "highpass_hz": 65,
+                "noise_suppression_db": -24, "highpass_hz": 65,
+                "quiet_expansion_db": -12,
+                "quiet_cells_attenuated": sum(gain < .9 for gain in quiet_gains),
             }
     except BaseException:
         if created:

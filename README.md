@@ -45,11 +45,13 @@ El acceso **Grabador de voz de Linux** y el comando `grabador-voz` abren la mism
 | Carpeta | Abrir la carpeta de grabaciones del modo elegido. |
 | X, a la derecha de la carpeta | Cerrar el grabador. Si está grabando, termina de guardar el archivo. |
 
+En modo voz, Play espera **0,75 segundos** antes de abrir el micrófono para dejar fuera el clic de inicio. Durante esa espera el contador muestra `…`; empezá a hablar cuando aparezca `00:00`. Cancelar, detener o cerrar durante la espera impide que la grabación empiece después.
+
 Arrastrá la barra manteniendo apretado el botón izquierdo del mouse. Su posición se conserva entre aperturas. `Esc` cancela la selección del área. El atajo opcional `Ctrl + Mayús + F10` detiene y guarda; para habilitarlo instalá `gir1.2-keybinder-3.0`.
 
 Los videos se guardan en **Vídeos → Grabaciones de pantalla**, en formato MP4 con video H.264 y audio AAC. La voz se guarda en **Música → Grabaciones de voz**, en WAV mono de 24 bits y 48 kHz. El modo voz usa únicamente un micrófono físico disponible; no mezcla el audio de los parlantes. El modo se cambia antes de comenzar una grabación.
 
-Al detener, el modo voz reduce el ruido de fondo estable y atenúa algunos clics aislados que quedan entre palabras. Después, sólo si detecta voz, ajusta el nivel de las grabaciones bajas, con una ganancia limitada de hasta 18 dB y un pico objetivo de −3 dBFS. Una grabación que contiene sólo ruido no recibe ese aumento de nivel. El procesamiento conserva el formato WAV y no cambia el volumen global del micrófono. Los clics que coinciden con la voz pueden seguir oyéndose; no se elimina la reverberación de la habitación.
+Al detener, el modo voz reduce el ruido de fondo estable y atenúa algunos clics aislados que quedan entre palabras o en los extremos del archivo. En las pausas claras aplica una atenuación suave adicional, protegiendo el inicio y el final de las palabras. Después, sólo si detecta evidencia sostenida de voz, ajusta el nivel de las grabaciones bajas, con una ganancia limitada de hasta 18 dB y un pico objetivo de −3 dBFS. Una grabación que contiene sólo ruido no recibe ese aumento de nivel. El procesamiento conserva el formato WAV y no cambia el volumen global del micrófono. Los clics que coinciden con la voz pueden seguir oyéndose; no se elimina la reverberación de la habitación.
 
 Al detener se guarda el archivo y se abre el reproductor predeterminado. La barra del grabador y sus descripciones se excluyen de los videos. Los dos modos conservan los mismos controles de pausa, reanudar, descartar y guardar.
 
