@@ -18,7 +18,7 @@ import tempfile
 
 APP_ID = "ar.workraken.GrabadorPantalla"
 APP_NAME = "Grabador de pantalla de Linux"
-FILES = ("app.py", "capture.py", "audio_capture.py", "geometry.py", "exclusion.py",
+FILES = ("app.py", "capture.py", "audio_capture.py", "voice_filter.py", "geometry.py", "exclusion.py",
          "pixel_filter.py", "x11_underlay.py", "icon.svg")
 GST_FACTORIES = ("ximagesrc", "queue", "videorate", "videoconvert", "capsfilter",
                  "x264enc", "h264parse", "mp4mux", "filesink", "adder",
@@ -46,6 +46,8 @@ def check_dependencies():
         missing.append("pactl (pulseaudio-utils)")
     if missing:
         raise RuntimeError("Faltan componentes: " + ", ".join(missing) + ". Consultá el README.")
+    if ctypes.util.find_library("speexdsp") is None:
+        print("Aviso: falta libspeexdsp1; la grabación sigue disponible sin reducción de ruido SpeexDSP.")
 
 
 def digest(path):

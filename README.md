@@ -49,7 +49,7 @@ Arrastrá la barra manteniendo apretado el botón izquierdo del mouse. Su posici
 
 Los videos se guardan en **Vídeos → Grabaciones de pantalla**, en formato MP4 con video H.264 y audio AAC. La voz se guarda en **Música → Grabaciones de voz**, en WAV mono de 24 bits y 48 kHz. El modo voz usa únicamente un micrófono físico disponible; no mezcla el audio de los parlantes. El modo se cambia antes de comenzar una grabación.
 
-El modo voz ajusta automáticamente el nivel de las grabaciones bajas, con una ganancia limitada de hasta 18 dB y un pico objetivo de −1 dBFS. No amplifica el silencio ni cambia el volumen global del micrófono. No elimina la reverberación de la habitación.
+Al detener, el modo voz reduce el ruido de fondo estable y atenúa algunos clics aislados que quedan entre palabras. Después, sólo si detecta voz, ajusta el nivel de las grabaciones bajas, con una ganancia limitada de hasta 18 dB y un pico objetivo de −3 dBFS. Una grabación que contiene sólo ruido no recibe ese aumento de nivel. El procesamiento conserva el formato WAV y no cambia el volumen global del micrófono. Los clics que coinciden con la voz pueden seguir oyéndose; no se elimina la reverberación de la habitación.
 
 Al detener se guarda el archivo y se abre el reproductor predeterminado. La barra del grabador y sus descripciones se excluyen de los videos. Los dos modos conservan los mismos controles de pausa, reanudar, descartar y guardar.
 
@@ -59,6 +59,7 @@ Al detener se guarda el archivo y se abre el reproductor predeterminado. La barr
 - Sesión gráfica **X11** con composición y las extensiones XComposite, XRender y XShape. Probado en Linux Mint 22.3 con Cinnamon.
 - PulseAudio o PipeWire con compatibilidad PulseAudio, una salida de audio y una entrada de micrófono disponibles.
 - Reproductor predeterminado para abrir MP4 y WAV.
+- Biblioteca opcional `libspeexdsp1` para reducir ruido en modo voz. Si falta o el filtro falla, se conserva el audio original sin limpieza ni amplificación; el instalador avisa si la biblioteca no está disponible.
 
 Wayland no está soportado. En la pantalla de inicio de sesión elegí una sesión X11. El modo pantalla captura el audio del sistema y el micrófono predeterminados; el modo voz usa sólo el micrófono. La aplicación no cambia el volumen ni la configuración global de los dispositivos.
 

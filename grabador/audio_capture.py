@@ -24,6 +24,11 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
 
+if __package__:
+    from .voice_filter import process_wave
+else:
+    from voice_filter import process_wave
+
 # CPython up to 3.12 provides fast, exact 24-bit PCM helpers. Python 3.13+
 # uses the bounded-memory fallback below and needs no extra dependency.
 try:
@@ -41,6 +46,7 @@ CHANNELS = 1
 NORMALIZATION_TARGET = 10 ** (-1 / 20)
 NORMALIZATION_MAX_GAIN = 10 ** (18 / 20)
 NORMALIZATION_MIN_PEAK = 10 ** (-60 / 20)
+VOICE_NORMALIZATION_TARGET = 10 ** (-3 / 20)
 PCM24_SCALE = 1 << 23
 REQUIRED_PLUGINS = (
     "pulsesrc", "audioconvert", "audioresample", "capsfilter", "level",
@@ -83,11 +89,16 @@ class AudioSession:
 
     Construct a new session for each recording. Call start/pause/resume/stop/cancel/save from
     the GLib main thread. Callback signatures are on_started(), on_ready(Path),
-    on_error(str), on_level(float) with a 0..1 peak, and on_cancelled(). A
+    on_error(str), on_level(float) with a 0..1 peak, and on_cancelled().
     Set normalize_peak=True to raise low levels toward -1 dBFS after EOS,
     limited to +18 dB. Already loud audio and near-silence below -60 dBFS stay
     unchanged. Processing runs off the GLib thread; on_ready receives its final
     result. A processing failure preserves the valid original WAV.
+
+    Set clean_voice=True to suppress background noise and isolated mouse
+    transients before normalizing. Cleaned voice targets -3 dBFS; gain requires
+    evidence of sustained speech. Noise-only audio and unavailable cleanup
+    remain unamplified. Global device volume and routing are never changed.
 
     A synchronous start/save validation error raises CaptureError; device and
     encoding errors discovered later invoke on_error. An existing destination
@@ -111,6 +122,7 @@ class AudioSession:
         temp_dir: str | Path | None = None,
         source_factory: str = "pulsesrc",
         normalize_peak: bool = False,
+        clean_voice: bool = False,
     ) -> None:
         if source_factory not in {"pulsesrc", "audiotestsrc"}:
             raise CaptureError("La fuente de audio no es compatible.")
@@ -124,6 +136,7 @@ class AudioSession:
         self.on_cancelled = on_cancelled
         self.source_factory = source_factory
         self.normalize_peak = bool(normalize_peak)
+        self.clean_voice = bool(clean_voice)
         self.temp_dir = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
         self.pipeline: Gst.Pipeline | None = None
         self._bus = None
@@ -142,7 +155,9 @@ class AudioSession:
         self._audio_buffers = 0
         self._normalization_cancelled = threading.Event()
         self._normalization_path: Path | None = None
+        self._filter_path: Path | None = None
         self._normalization_gain = 1.0
+        self._voice_cleanup = {}
 
     @property
     def state(self) -> str:
@@ -182,6 +197,7 @@ class AudioSession:
             "channels": CHANNELS, "sample_width": SAMPLE_WIDTH,
             "device": self.device, "source_factory": self.source_factory,
             "normalization_gain": self._normalization_gain,
+            "voice_cleanup": dict(self._voice_cleanup),
         }
 
     def _callback(self, callback, *args) -> None:
@@ -422,9 +438,11 @@ class AudioSession:
         except (OSError, EOFError, wave.Error, CaptureError) as exc:
             self._fail(f"No se pudo finalizar la grabación: {exc}")
             return
-        if self.normalize_peak:
+        if self.normalize_peak or self.clean_voice:
             self._state = "processing"
             self._normalization_path = self._temporary_path.with_name("normalizada.wav")
+            if self.clean_voice:
+                self._filter_path = self._temporary_path.with_name("filtrada.wav")
             threading.Thread(target=self._normalize_background,
                              args=(self._temporary_path, self._normalization_path),
                              name="grabador-normalizar-voz", daemon=True).start()
@@ -438,20 +456,36 @@ class AudioSession:
         self._callback(self.on_ready, self._temporary_path)
 
     def _normalize_background(self, source: Path, destination: Path) -> None:
-        """Scan and amplify PCM off the GTK thread, keeping the original until done."""
+        """Clean before raising levels, keeping the original intact until done."""
         gain = 1.0
         modified = False
         error = None
+        filtered = source.with_name("filtrada.wav")
+        work_source = source
         try:
+            if self.clean_voice:
+                try:
+                    self._voice_cleanup = process_wave(source, filtered, self._normalization_cancelled)
+                    self._voice_cleanup["applied"] = True
+                    work_source = filtered
+                except Exception as exc:
+                    # A missing processor must not lose the recording or raise
+                    # the untreated background noise through normalization.
+                    self._voice_cleanup = {"applied": False, "reason": str(exc)}
+                    LOGGER.warning("No se pudo limpiar la voz; se conserva el audio sin amplificar: %s", exc)
+            should_raise_level = self.normalize_peak and (
+                not self.clean_voice or self._voice_cleanup.get("speech_detected", False)
+            )
             peak = 0
-            with wave.open(str(source), "rb") as recording:
+            with wave.open(str(work_source), "rb") as recording:
                 while not self._normalization_cancelled.is_set():
                     data = recording.readframes(32_768)
                     if not data:
                         break
                     peak = max(peak, _pcm24_peak(data))
-                if peak >= NORMALIZATION_MIN_PEAK * PCM24_SCALE:
-                    gain = min(NORMALIZATION_MAX_GAIN, NORMALIZATION_TARGET * PCM24_SCALE / peak)
+                if should_raise_level and peak >= NORMALIZATION_MIN_PEAK * PCM24_SCALE:
+                    target = VOICE_NORMALIZATION_TARGET if self.clean_voice else NORMALIZATION_TARGET
+                    gain = min(NORMALIZATION_MAX_GAIN, target * PCM24_SCALE / peak)
                 # Preserve silence, loud recordings and already suitable levels.
                 if gain > 10 ** (1 / 20) and not self._normalization_cancelled.is_set():
                     recording.rewind()
@@ -469,8 +503,17 @@ class AudioSession:
                     modified = True
                 else:
                     gain = 1.0
+            if not modified and work_source == filtered and not self._normalization_cancelled.is_set():
+                filtered.replace(destination)
+                modified = True
         except Exception as exc:
             error = str(exc)
+        finally:
+            if self.clean_voice:
+                try:
+                    filtered.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception("No se pudo retirar la copia temporal del filtro")
         if self._normalization_cancelled.is_set():
             try:
                 destination.unlink(missing_ok=True)
@@ -506,6 +549,8 @@ class AudioSession:
             LOGGER.exception("No se pudo retirar la copia normalizada incompleta")
         self._normalization_path = None
         self._normalization_gain = 1.0
+        if self.clean_voice:
+            self._voice_cleanup["applied"] = False
         self._ready()
 
     def _fail(self, message: str) -> None:
@@ -557,6 +602,12 @@ class AudioSession:
         self.pipeline = None
 
     def _remove_owned_files(self) -> None:
+        if self._filter_path is not None:
+            try:
+                self._filter_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("No se pudo retirar el WAV filtrado temporal propio")
+            self._filter_path = None
         if self._normalization_path is not None:
             try:
                 self._normalization_path.unlink(missing_ok=True)

@@ -661,7 +661,7 @@ class RecorderApp(Gtk.Application):
             self.failed(error)
             return False
         try:
-            self.session = AudioSession(device=device, normalize_peak=True,
+            self.session = AudioSession(device=device, normalize_peak=True, clean_voice=True,
                 on_started=lambda: self.audio_event(generation, self.started),
                 on_ready=lambda _path: self.audio_event(generation, self.save_audio),
                 on_error=lambda message: self.audio_event(generation, self.failed, message),

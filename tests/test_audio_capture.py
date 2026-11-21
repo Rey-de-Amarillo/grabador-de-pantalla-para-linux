@@ -86,6 +86,36 @@ class AudioSessionTests(unittest.TestCase):
         with wave.open(str(session.temporary_path), "rb") as recording:
             return _pcm24_peak(recording.readframes(recording.getnframes())) / PCM24_SCALE
 
+    def test_unavailable_cleaner_preserves_audio_without_boosting_untreated_noise(self):
+        with mock.patch("grabador.audio_capture.process_wave", side_effect=RuntimeError("processor unavailable")):
+            session, _, _ = self.record(volume=0.002, clean_voice=True, normalize_peak=True)
+        self.assertAlmostEqual(self.peak(session), 0.002, delta=0.00001)
+        self.assertEqual(session.statistics["normalization_gain"], 1)
+        self.assertFalse(session.statistics["voice_cleanup"]["applied"])
+        self.assertEqual([p.name for p in session.temporary_path.parent.iterdir()], ["grabacion.wav"])
+
+    def test_noise_only_cleaned_recording_is_not_raised_to_full_volume(self):
+        def noise_filter(source, destination, _cancel):
+            destination.write_bytes(source.read_bytes())
+            return {"speech_detected": False, "speex": True}
+        with mock.patch("grabador.audio_capture.process_wave", side_effect=noise_filter):
+            session, _, _ = self.record(volume=0.002, clean_voice=True, normalize_peak=True)
+        self.assertAlmostEqual(self.peak(session), 0.002, delta=0.00001)
+        self.assertEqual(session.statistics["normalization_gain"], 1)
+        self.assertTrue(session.statistics["voice_cleanup"]["applied"])
+
+    def test_speech_gain_is_applied_after_cleanup_and_remains_bounded(self):
+        def voice_filter(source, destination, _cancel):
+            with wave.open(str(source), "rb") as before, wave.open(str(destination), "wb") as after:
+                after.setparams(before.getparams())
+                after.writeframes(_pcm24_amplify(before.readframes(before.getnframes()), 0.5))
+            return {"speech_detected": True, "speex": True}
+        with mock.patch("grabador.audio_capture.process_wave", side_effect=voice_filter):
+            session, _, _ = self.record(volume=0.002, clean_voice=True, normalize_peak=True)
+        self.assertAlmostEqual(self.peak(session), 0.001 * NORMALIZATION_MAX_GAIN, delta=0.00002)
+        self.assertAlmostEqual(session.statistics["normalization_gain"], NORMALIZATION_MAX_GAIN)
+        self.assertEqual([p.name for p in session.temporary_path.parent.iterdir()], ["grabacion.wav"])
+
     def test_constructor_never_opens_audio_or_creates_files(self):
         with mock.patch.object(Gst.ElementFactory, "make", side_effect=AssertionError("opened an input")):
             session = AudioSession(temp_dir=self.directory)

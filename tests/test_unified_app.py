@@ -192,6 +192,7 @@ class UnifiedToolbarTests(unittest.TestCase):
         recorder = self.recorder
         with mock.patch.object(app, "CaptureSession", side_effect=AssertionError("screen opened")):
             session = self.start_audio()
+            self.assertTrue(session.clean_voice)
             self.wait_for(lambda: session.elapsed >= 0.12)
             self.assertFalse(recorder.icon.recording)
             self.assertTrue(recorder.mode_icon.recording)
